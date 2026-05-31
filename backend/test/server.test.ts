@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import request from "supertest";
+import bcrypt from "bcrypt";
 import { pool } from "../src/db.js";
 import { app, sessions } from "../src/server.js";
 
@@ -9,10 +10,13 @@ import { app, sessions } from "../src/server.js";
 const query = vi.fn();
 (pool as unknown as { query: typeof query }).query = query;
 
-// Helper: register a fake session token and return an auth header.
+// Helper: register a fake session token and return an auth header. Seeding the
+// in-memory cache directly means the auth middleware resolves the token without
+// touching the (mocked) database, so per-test query sequences stay focused on
+// the route under test.
 function authAs(userId: number): string {
   const token = `test-token-${userId}`;
-  sessions.set(token, userId);
+  sessions.set(token, { userId, expiresAt: Date.now() + 60_000 });
   return `Bearer ${token}`;
 }
 
@@ -28,6 +32,8 @@ describe("auth middleware", () => {
   });
 
   it("rejects requests with an unknown token", async () => {
+    // Not in the cache, so resolveSession falls back to the DB and finds nothing.
+    query.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // session lookup misses
     const res = await request(app)
       .get("/api/projects")
       .set("Authorization", "Bearer nope");
@@ -188,5 +194,105 @@ describe("issue creation uses the session as reporter", () => {
       String(c[0]).includes("INSERT INTO issue_history")
     )!;
     expect(historyCall[1]).toContain(77);
+  });
+});
+
+describe("attachment authorization", () => {
+  it("lets the original uploader delete their own attachment", async () => {
+    query.mockResolvedValueOnce({
+      rows: [{ filename: "abc", uploaded_by: 5 }],
+      rowCount: 1,
+    }); // SELECT attachment
+    query.mockResolvedValueOnce({ rowCount: 1, rows: [] }); // DELETE attachment
+
+    const res = await request(app)
+      .delete("/api/attachments/1")
+      .set("Authorization", authAs(5));
+
+    expect(res.status).toBe(200);
+  });
+
+  it("lets an admin delete someone else's attachment", async () => {
+    query.mockResolvedValueOnce({
+      rows: [{ filename: "abc", uploaded_by: 5 }],
+      rowCount: 1,
+    }); // SELECT attachment
+    query.mockResolvedValueOnce({ rows: [{ role: "admin" }], rowCount: 1 }); // requireAdmin
+    query.mockResolvedValueOnce({ rowCount: 1, rows: [] }); // DELETE attachment
+
+    const res = await request(app)
+      .delete("/api/attachments/1")
+      .set("Authorization", authAs(9));
+
+    expect(res.status).toBe(200);
+  });
+
+  it("forbids a non-owner non-admin from deleting an attachment", async () => {
+    query.mockResolvedValueOnce({
+      rows: [{ filename: "abc", uploaded_by: 5 }],
+      rowCount: 1,
+    }); // SELECT attachment
+    query.mockResolvedValueOnce({ rows: [{ role: "user" }], rowCount: 1 }); // requireAdmin
+
+    const res = await request(app)
+      .delete("/api/attachments/1")
+      .set("Authorization", authAs(8));
+
+    expect(res.status).toBe(403);
+    // It must not issue a DELETE when the actor is not authorized.
+    const deleteCall = query.mock.calls.find((c) =>
+      String(c[0]).includes("DELETE FROM attachments")
+    );
+    expect(deleteCall).toBeUndefined();
+  });
+
+  it("returns 404 when deleting a missing attachment", async () => {
+    query.mockResolvedValueOnce({ rows: [], rowCount: 0 }); // SELECT attachment misses
+
+    const res = await request(app)
+      .delete("/api/attachments/999")
+      .set("Authorization", authAs(5));
+
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("session lifecycle", () => {
+  it("persists a session to the database on login", async () => {
+    const hash = await bcrypt.hash("secret", 10);
+    query.mockResolvedValueOnce({
+      rows: [
+        { id: 3, name: "Ada", email: "ada@example.com", role: "user", locale: "en-US", password_hash: hash },
+      ],
+      rowCount: 1,
+    }); // user lookup
+    query.mockResolvedValueOnce({ rowCount: 1, rows: [] }); // INSERT session
+
+    const res = await request(app)
+      .post("/api/auth/login")
+      .send({ email: "ada@example.com", password: "secret" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.token).toBeTypeOf("string");
+
+    const insertCall = query.mock.calls.find((c) =>
+      String(c[0]).includes("INSERT INTO sessions")
+    )!;
+    expect(insertCall).toBeDefined();
+    expect(insertCall[1][1]).toBe(3); // user_id persisted
+  });
+
+  it("deletes the session from the database on logout", async () => {
+    query.mockResolvedValueOnce({ rowCount: 1, rows: [] }); // DELETE session
+
+    const res = await request(app)
+      .post("/api/auth/logout")
+      .set("Authorization", authAs(5));
+
+    expect(res.status).toBe(200);
+    const deleteCall = query.mock.calls.find((c) =>
+      String(c[0]).includes("DELETE FROM sessions")
+    )!;
+    expect(deleteCall).toBeDefined();
   });
 });

@@ -55,11 +55,61 @@ const upload = multer({
 
 const SALT_ROUNDS = 12;
 
-// In-memory session store: token -> userId
-const sessions = new Map<string, number>();
+// Sessions live in the database (source of truth) so they survive restarts and
+// are shared across instances. This in-memory Map is a write-through cache to
+// avoid a DB round-trip on every authenticated request; entries carry their own
+// expiry so stale ones self-heal without waiting for a restart.
+interface CachedSession {
+  userId: number;
+  expiresAt: number; // epoch millis
+}
+const sessions = new Map<string, CachedSession>();
+
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 function generateToken(): string {
   return crypto.randomBytes(32).toString("hex");
+}
+
+async function createSession(userId: number): Promise<string> {
+  const token = generateToken();
+  const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
+  await pool.query(
+    "INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, $3)",
+    [token, userId, expiresAt]
+  );
+  sessions.set(token, { userId, expiresAt: expiresAt.getTime() });
+  return token;
+}
+
+// Resolve a token to a user id, consulting the cache first and falling back to
+// the database. Returns null for unknown or expired tokens.
+async function resolveSession(token: string): Promise<number | null> {
+  const cached = sessions.get(token);
+  if (cached) {
+    if (cached.expiresAt > Date.now()) return cached.userId;
+    sessions.delete(token); // expired — fall through and clean up the DB row
+  }
+
+  const { rows } = await pool.query(
+    "SELECT user_id, expires_at FROM sessions WHERE token = $1",
+    [token]
+  );
+  if (rows.length === 0) return null;
+
+  const expiresAt = new Date(rows[0].expires_at).getTime();
+  if (expiresAt <= Date.now()) {
+    await pool.query("DELETE FROM sessions WHERE token = $1", [token]);
+    return null;
+  }
+
+  sessions.set(token, { userId: rows[0].user_id, expiresAt });
+  return rows[0].user_id;
+}
+
+async function destroySession(token: string): Promise<void> {
+  sessions.delete(token);
+  await pool.query("DELETE FROM sessions WHERE token = $1", [token]);
 }
 
 const app = express();
@@ -77,10 +127,10 @@ const loginLimiter = rateLimit({
 });
 
 // Auth middleware — applied to all routes except /health and /api/auth/*
-function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+async function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
   const auth = req.headers.authorization;
   if (!auth?.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
-  const userId = sessions.get(auth.slice(7));
+  const userId = await resolveSession(auth.slice(7));
   if (!userId) return res.status(401).json({ error: "Unauthorized" });
   req.userId = userId;
   next();
@@ -120,14 +170,13 @@ app.post("/api/auth/login", loginLimiter, async (req, res) => {
   if (!user.password_hash) return res.status(401).json({ error: "No password set for this account" });
   const match = await bcrypt.compare(body.password, user.password_hash);
   if (!match) return res.status(401).json({ error: "Invalid email or password" });
-  const token = generateToken();
-  sessions.set(token, user.id);
+  const token = await createSession(user.id);
   res.json({ token, id: user.id, name: user.name, email: user.email, role: user.role, locale: user.locale });
 });
 
-app.post("/api/auth/logout", (req, res) => {
+app.post("/api/auth/logout", async (req, res) => {
   const auth = req.headers.authorization;
-  if (auth?.startsWith("Bearer ")) sessions.delete(auth.slice(7));
+  if (auth?.startsWith("Bearer ")) await destroySession(auth.slice(7));
   res.json({ ok: true });
 });
 
@@ -605,6 +654,16 @@ app.post("/api/issues/:issueId/attachments", upload.single("file"), async (req, 
   const issueId = Number(req.params.issueId);
   if (!req.file) return res.status(400).json({ error: "No file provided" });
 
+  // Multer has already written the file to disk by the time we get here, so if
+  // the target issue does not exist we must clean up the orphaned upload before
+  // returning, otherwise it would leak on the filesystem.
+  const issueExists = await pool.query("SELECT 1 FROM issues WHERE id = $1", [issueId]);
+  if (issueExists.rowCount === 0) {
+    const orphanPath = path.join(UPLOADS_DIR, req.file.filename);
+    if (fs.existsSync(orphanPath)) fs.unlinkSync(orphanPath);
+    return res.status(404).json({ error: "Issue not found" });
+  }
+
   const { rows } = await pool.query(
     `INSERT INTO attachments (issue_id, filename, original_name, mime_type, size, uploaded_by)
      VALUES ($1, $2, $3, $4, $5, $6)
@@ -621,15 +680,24 @@ app.get("/api/attachments/:id/file", async (req, res) => {
   );
   if (rows.length === 0) return res.status(404).json({ error: "Attachment not found" });
   const filePath = path.join(UPLOADS_DIR, rows[0].filename);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
   res.download(filePath, rows[0].original_name);
 });
 
 app.delete("/api/attachments/:id", async (req, res) => {
+  const actorId = req.userId!;
   const { rows } = await pool.query(
-    "DELETE FROM attachments WHERE id = $1 RETURNING filename",
+    "SELECT filename, uploaded_by FROM attachments WHERE id = $1",
     [Number(req.params.id)]
   );
   if (rows.length === 0) return res.status(404).json({ error: "Attachment not found" });
+
+  // Only the original uploader or an admin may delete an attachment.
+  if (rows[0].uploaded_by !== actorId && !await requireAdmin(actorId)) {
+    return res.status(403).json({ error: "Not allowed to delete this attachment" });
+  }
+
+  await pool.query("DELETE FROM attachments WHERE id = $1", [Number(req.params.id)]);
   const filePath = path.join(UPLOADS_DIR, rows[0].filename);
   if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   res.json({ ok: true });
