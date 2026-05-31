@@ -12,6 +12,17 @@ import { z } from "zod";
 import { config } from "./config.js";
 import { pool } from "./db.js";
 
+// Augment Express's Request so requireAuth can stash the authenticated user id.
+// This avoids per-handler casts that break on routes with typed path params.
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request {
+      userId?: number;
+    }
+  }
+}
+
 const UPLOADS_DIR = path.resolve(process.cwd(), "uploads");
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
@@ -71,7 +82,7 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
   if (!auth?.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
   const userId = sessions.get(auth.slice(7));
   if (!userId) return res.status(401).json({ error: "Unauthorized" });
-  (req as express.Request & { userId: number }).userId = userId;
+  req.userId = userId;
   next();
 }
 
@@ -88,7 +99,7 @@ async function requireAdmin(actorId: number): Promise<boolean> {
 // Middleware guard for routes that require an admin session. Relies on
 // requireAuth having already populated req.userId.
 async function adminOnly(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const actorId = (req as express.Request & { userId: number }).userId;
+  const actorId = req.userId!;
   if (!await requireAdmin(actorId)) return res.status(403).json({ error: "Admin access required" });
   next();
 }
@@ -139,7 +150,7 @@ const userSchema = z.object({
 });
 
 app.post("/api/users", async (req, res) => {
-  const actorId = (req as express.Request & { userId: number }).userId;
+  const actorId = req.userId!;
   const body = userSchema.parse(req.body);
   if (!await requireAdmin(actorId)) return res.status(403).json({ error: "Admin access required" });
   const existing = await pool.query("SELECT id FROM users WHERE email = $1", [body.email]);
@@ -161,7 +172,7 @@ const updateUserSchema = z.object({
 });
 
 app.patch("/api/users/:userId", async (req, res) => {
-  const actorId = (req as express.Request & { userId: number }).userId;
+  const actorId = req.userId!;
   const userId = Number(req.params.userId);
   const body = updateUserSchema.parse(req.body);
   if (!await requireAdmin(actorId)) return res.status(403).json({ error: "Admin access required" });
@@ -188,7 +199,7 @@ app.patch("/api/users/:userId", async (req, res) => {
 });
 
 app.delete("/api/users/:userId", async (req, res) => {
-  const actorId = (req as express.Request & { userId: number }).userId;
+  const actorId = req.userId!;
   const userId = Number(req.params.userId);
   if (!await requireAdmin(actorId)) return res.status(403).json({ error: "Admin access required" });
   const assigned = await pool.query(
@@ -411,7 +422,7 @@ const createIssueSchema = z.object({
 });
 
 app.post("/api/issues", async (req, res) => {
-  const reporterId = (req as express.Request & { userId: number }).userId;
+  const reporterId = req.userId!;
   const body = createIssueSchema.parse(req.body);
 
   const initialStatusResult = await pool.query(
@@ -463,7 +474,7 @@ const updateIssueSchema = z.object({
 });
 
 app.patch("/api/issues/:issueId", async (req, res) => {
-  const actorId = (req as express.Request & { userId: number }).userId;
+  const actorId = req.userId!;
   const issueId = Number(req.params.issueId);
   const body = updateIssueSchema.parse(req.body);
 
@@ -510,7 +521,7 @@ const statusChangeSchema = z.object({
 });
 
 app.patch("/api/issues/:issueId/status", async (req, res) => {
-  const actorId = (req as express.Request & { userId: number }).userId;
+  const actorId = req.userId!;
   const issueId = Number(req.params.issueId);
   const body = statusChangeSchema.parse(req.body);
 
@@ -570,7 +581,7 @@ const commentSchema = z.object({
 });
 
 app.post("/api/issues/:issueId/comments", async (req, res) => {
-  const actorId = (req as express.Request & { userId: number }).userId;
+  const actorId = req.userId!;
   const issueId = Number(req.params.issueId);
   const body = commentSchema.parse(req.body);
 
@@ -590,7 +601,7 @@ app.post("/api/issues/:issueId/comments", async (req, res) => {
 });
 
 app.post("/api/issues/:issueId/attachments", upload.single("file"), async (req, res) => {
-  const uploadedBy = (req as express.Request & { userId: number }).userId;
+  const uploadedBy = req.userId!;
   const issueId = Number(req.params.issueId);
   if (!req.file) return res.status(400).json({ error: "No file provided" });
 

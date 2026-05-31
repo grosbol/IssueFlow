@@ -1,12 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import request from "supertest";
+import { pool } from "../src/db.js";
+import { app, sessions } from "../src/server.js";
 
-// Mock the pg pool before importing the server. Every handler funnels through
-// pool.query, so a single controllable mock lets us drive any code path.
-const { query } = vi.hoisted(() => ({ query: vi.fn() }));
-vi.mock("../src/db.js", () => ({ pool: { query } }));
-
-const { app, sessions } = await import("../src/server.js");
+// Replace the real pg query with a controllable mock. Every handler funnels
+// through pool.query at request time, so overriding the method intercepts all
+// database access — no real Postgres connection is ever opened.
+const query = vi.fn();
+(pool as unknown as { query: typeof query }).query = query;
 
 // Helper: register a fake session token and return an auth header.
 function authAs(userId: number): string {
@@ -17,10 +18,6 @@ function authAs(userId: number): string {
 
 beforeEach(() => {
   query.mockReset();
-  sessions.clear();
-});
-
-afterEach(() => {
   sessions.clear();
 });
 
@@ -108,7 +105,7 @@ describe("workflow transition validation", () => {
 
     // History is written with the acting user and the human-readable names.
     const historyCall = query.mock.calls.at(-1)!;
-    expect(historyCall[0]).toContain("INSERT INTO issue_history");
+    expect(String(historyCall[0])).toContain("INSERT INTO issue_history");
     expect(historyCall[1]).toEqual([42, 9, "To Do", "Done"]);
   });
 
