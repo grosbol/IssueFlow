@@ -85,6 +85,14 @@ async function requireAdmin(actorId: number): Promise<boolean> {
   return rows.length > 0 && rows[0].role === "admin";
 }
 
+// Middleware guard for routes that require an admin session. Relies on
+// requireAuth having already populated req.userId.
+async function adminOnly(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const actorId = (req as express.Request & { userId: number }).userId;
+  if (!await requireAdmin(actorId)) return res.status(403).json({ error: "Admin access required" });
+  next();
+}
+
 const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
@@ -212,7 +220,7 @@ const projectSchema = z.object({
   workflowId: z.number().int().positive(),
 });
 
-app.post("/api/projects", async (req, res) => {
+app.post("/api/projects", adminOnly, async (req, res) => {
   const body = projectSchema.parse(req.body);
   const exists = await pool.query("SELECT id FROM projects WHERE key = $1", [body.key]);
   if (exists.rowCount! > 0) return res.status(409).json({ error: "Project key already in use" });
@@ -223,7 +231,7 @@ app.post("/api/projects", async (req, res) => {
   res.status(201).json(rows[0]);
 });
 
-app.patch("/api/projects/:projectId", async (req, res) => {
+app.patch("/api/projects/:projectId", adminOnly, async (req, res) => {
   const projectId = Number(req.params.projectId);
   const body = projectSchema.partial().parse(req.body);
   const updates: string[] = [];
@@ -242,7 +250,7 @@ app.patch("/api/projects/:projectId", async (req, res) => {
   res.json(rows[0]);
 });
 
-app.delete("/api/projects/:projectId", async (req, res) => {
+app.delete("/api/projects/:projectId", adminOnly, async (req, res) => {
   const projectId = Number(req.params.projectId);
   const inUse = await pool.query("SELECT COUNT(*) FROM issues WHERE project_id = $1", [projectId]);
   if (Number(inUse.rows[0].count) > 0)
@@ -399,11 +407,11 @@ const createIssueSchema = z.object({
   title: z.string().min(3),
   description: z.string().default(""),
   assigneeId: z.number().nullable().optional(),
-  reporterId: z.number().optional().default(1),
   priority: z.enum(["low", "medium", "high"]).default("medium"),
 });
 
 app.post("/api/issues", async (req, res) => {
+  const reporterId = (req as express.Request & { userId: number }).userId;
   const body = createIssueSchema.parse(req.body);
 
   const initialStatusResult = await pool.query(
@@ -431,7 +439,7 @@ app.post("/api/issues", async (req, res) => {
       body.description,
       initialStatusResult.rows[0].id,
       body.assigneeId ?? null,
-      body.reporterId,
+      reporterId,
       body.priority,
     ]
   );
@@ -441,7 +449,7 @@ app.post("/api/issues", async (req, res) => {
   await pool.query(
     `INSERT INTO issue_history (issue_id, actor_id, field, from_value, to_value)
      VALUES ($1, $2, 'status', NULL, $3)`,
-    [issueId, body.reporterId, initialStatusResult.rows[0].name]
+    [issueId, reporterId, initialStatusResult.rows[0].name]
   );
 
   res.status(201).json({ id: issueId });
@@ -640,7 +648,7 @@ app.get("/api/workflows/:id", async (req, res) => {
 
 const newWorkflowSchema = z.object({ name: z.string().min(1) });
 
-app.post("/api/workflows", async (req, res) => {
+app.post("/api/workflows", adminOnly, async (req, res) => {
   const body = newWorkflowSchema.parse(req.body);
   const { rows } = await pool.query(
     "INSERT INTO workflows (name) VALUES ($1) RETURNING id, name",
@@ -649,7 +657,7 @@ app.post("/api/workflows", async (req, res) => {
   res.status(201).json(rows[0]);
 });
 
-app.patch("/api/workflows/:id", async (req, res) => {
+app.patch("/api/workflows/:id", adminOnly, async (req, res) => {
   const body = newWorkflowSchema.parse(req.body);
   const { rows } = await pool.query(
     "UPDATE workflows SET name = $1 WHERE id = $2 RETURNING id, name",
@@ -665,7 +673,7 @@ const newStatusSchema = z.object({
   sortOrder: z.number().default(0),
 });
 
-app.post("/api/workflows/:id/statuses", async (req, res) => {
+app.post("/api/workflows/:id/statuses", adminOnly, async (req, res) => {
   const workflowId = Number(req.params.id);
   const body = newStatusSchema.parse(req.body);
   const { rows } = await pool.query(
@@ -681,7 +689,7 @@ const updateStatusSchema2 = z.object({
   sortOrder: z.number().optional(),
 });
 
-app.patch("/api/statuses/:id", async (req, res) => {
+app.patch("/api/statuses/:id", adminOnly, async (req, res) => {
   const statusId = Number(req.params.id);
   const body = updateStatusSchema2.parse(req.body);
   const updates: string[] = [];
@@ -700,7 +708,7 @@ app.patch("/api/statuses/:id", async (req, res) => {
   res.json(rows[0]);
 });
 
-app.delete("/api/statuses/:id", async (req, res) => {
+app.delete("/api/statuses/:id", adminOnly, async (req, res) => {
   const statusId = Number(req.params.id);
   const inUse = await pool.query("SELECT COUNT(*) FROM issues WHERE status_id = $1", [statusId]);
   if (Number(inUse.rows[0].count) > 0)
@@ -713,7 +721,7 @@ app.delete("/api/statuses/:id", async (req, res) => {
 
 const transitionBodySchema = z.object({ fromStatusId: z.number(), toStatusId: z.number() });
 
-app.post("/api/workflows/:id/transitions", async (req, res) => {
+app.post("/api/workflows/:id/transitions", adminOnly, async (req, res) => {
   const workflowId = Number(req.params.id);
   const body = transitionBodySchema.parse(req.body);
   await pool.query(
@@ -723,7 +731,7 @@ app.post("/api/workflows/:id/transitions", async (req, res) => {
   res.status(201).json({ ok: true });
 });
 
-app.delete("/api/workflows/:id/transitions", async (req, res) => {
+app.delete("/api/workflows/:id/transitions", adminOnly, async (req, res) => {
   const workflowId = Number(req.params.id);
   const body = transitionBodySchema.parse(req.body);
   await pool.query(
@@ -743,13 +751,19 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
   res.status(500).json({ error: "Internal server error" });
 });
 
+export { app, sessions };
+
 async function start() {
   app.listen(config.port, () => {
     console.log(`IssueFlow API listening on http://localhost:${config.port}`);
   });
 }
 
-start().catch((error) => {
-  console.error("Failed to start server", error);
-  process.exit(1);
-});
+// Only bind the port when run as the entrypoint, so tests can import `app`
+// and drive it with supertest without opening a socket.
+if (process.env.NODE_ENV !== "test") {
+  start().catch((error) => {
+    console.error("Failed to start server", error);
+    process.exit(1);
+  });
+}
