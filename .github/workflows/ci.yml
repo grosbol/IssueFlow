@@ -6,6 +6,7 @@ on:
       - main
       - master
       - "codex/**"
+      - "claude/**"
   pull_request:
 
 jobs:
@@ -32,3 +33,7 @@ jobs:
       - name: Build
         working-directory: ${{ matrix.project }}
         run: npm run build
+
+      - name: Test
+        working-directory: ${{ matrix.project }}
+        run: npm test --if-present
