@@ -33,13 +33,45 @@ INSERT INTO projects (id, name, key, workflow_id)
 VALUES (1, 'IssueFlow', 'IF', 1)
 ON CONFLICT (id) DO NOTHING;
 
-INSERT INTO issues (id, project_id, title, description, status_id, assignee_id, reporter_id, priority)
+INSERT INTO issues (id, project_id, title, description, status_id, assignee_id, reporter_id, priority, due_date)
 VALUES
-  (1, 1, 'Design board experience', 'Create the kanban overview for the MVP.', 2, 1, 2, 'high'),
-  (2, 1, 'Guard workflow transitions', 'Reject invalid status changes in the API.', 3, 2, 1, 'high'),
-  (3, 1, 'Dockerize local setup', 'Prepare on-prem friendly deployment via Docker Compose.', 1, 3, 1, 'medium'),
-  (4, 1, 'Investigate SSO later', 'Nice-to-have after the MVP is stable.', 4, 1, 3, 'low')
-ON CONFLICT (id) DO NOTHING;
+  (1, 1, 'Design board experience', 'Create the kanban overview for the MVP.', 2, 1, 2, 'high', CURRENT_DATE + INTERVAL '3 days'),
+  (2, 1, 'Guard workflow transitions', 'Reject invalid status changes in the API.', 3, 2, 1, 'high', CURRENT_DATE + INTERVAL '1 day'),
+  (3, 1, 'Dockerize local setup', 'Prepare on-prem friendly deployment via Docker Compose.', 1, 3, 1, 'medium', CURRENT_DATE + INTERVAL '7 days'),
+  (4, 1, 'Investigate SSO later', 'Nice-to-have after the MVP is stable.', 4, 1, 3, 'low', NULL)
+ON CONFLICT (id) DO UPDATE SET due_date = EXCLUDED.due_date;
+
+INSERT INTO labels (project_id, name, color)
+SELECT *
+FROM (
+  VALUES
+    (1, 'frontend', '#0f766e'),
+    (1, 'backend', '#1d4ed8'),
+    (1, 'ops', '#7c3aed'),
+    (1, 'research', '#b45309'),
+    (1, 'ux', '#be185d')
+) AS seed(project_id, name, color)
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM labels l
+  WHERE l.project_id = seed.project_id
+    AND lower(l.name) = lower(seed.name)
+);
+
+INSERT INTO issue_labels (issue_id, label_id)
+SELECT seed.issue_id, l.id
+FROM (
+  VALUES
+    (1, 'frontend'),
+    (1, 'ux'),
+    (2, 'backend'),
+    (3, 'ops'),
+    (4, 'research')
+) AS seed(issue_id, label_name)
+JOIN labels l
+  ON l.project_id = 1
+ AND lower(l.name) = lower(seed.label_name)
+ON CONFLICT DO NOTHING;
 
 INSERT INTO comments (issue_id, user_id, content)
 SELECT *
@@ -81,5 +113,6 @@ SELECT setval(pg_get_serial_sequence('workflows',     'id'), GREATEST((SELECT MA
 SELECT setval(pg_get_serial_sequence('statuses',      'id'), GREATEST((SELECT MAX(id) FROM statuses),      1));
 SELECT setval(pg_get_serial_sequence('projects',      'id'), GREATEST((SELECT MAX(id) FROM projects),      1));
 SELECT setval(pg_get_serial_sequence('issues',        'id'), GREATEST((SELECT MAX(id) FROM issues),        1));
+SELECT setval(pg_get_serial_sequence('labels',        'id'), GREATEST((SELECT MAX(id) FROM labels),        1));
 SELECT setval(pg_get_serial_sequence('comments',      'id'), GREATEST((SELECT MAX(id) FROM comments),      1));
 SELECT setval(pg_get_serial_sequence('issue_history', 'id'), GREATEST((SELECT MAX(id) FROM issue_history), 1));

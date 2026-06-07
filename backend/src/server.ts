@@ -43,6 +43,16 @@ const upload = multer({
 });
 
 const SALT_ROUNDS = 12;
+const LABEL_COLORS = [
+  "#0f766e",
+  "#1d4ed8",
+  "#7c3aed",
+  "#b45309",
+  "#be185d",
+  "#0f766e",
+  "#0369a1",
+  "#4d7c0f",
+] as const;
 
 // In-memory session store: token -> userId
 const sessions = new Map<string, number>();
@@ -52,6 +62,7 @@ function generateToken(): string {
 }
 
 const app = express();
+app.set("trust proxy", 1);
 
 app.use(helmet());
 app.use(cors({ origin: config.corsOrigin }));
@@ -83,6 +94,72 @@ app.get("/health", async (_req, res) => {
 async function requireAdmin(actorId: number): Promise<boolean> {
   const { rows } = await pool.query("SELECT role FROM users WHERE id = $1", [actorId]);
   return rows.length > 0 && rows[0].role === "admin";
+}
+
+function normalizeLabelNames(names: string[] | undefined): string[] {
+  if (!names) return [];
+
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+
+  for (const name of names) {
+    const trimmed = name.trim().replace(/\s+/g, " ");
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(trimmed.slice(0, 24));
+  }
+
+  return normalized;
+}
+
+function colorForLabel(name: string): string {
+  let hash = 0;
+  for (const char of name) {
+    hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  }
+  return LABEL_COLORS[hash % LABEL_COLORS.length];
+}
+
+async function syncIssueLabels(issueId: number, projectId: number, labelNames: string[]) {
+  const normalizedNames = normalizeLabelNames(labelNames);
+
+  await pool.query("DELETE FROM issue_labels WHERE issue_id = $1", [issueId]);
+  if (normalizedNames.length === 0) return;
+
+  const labelIds: number[] = [];
+  for (const name of normalizedNames) {
+    const existing = await pool.query(
+      `SELECT id
+       FROM labels
+       WHERE project_id = $1
+         AND lower(name) = lower($2)`,
+      [projectId, name]
+    );
+
+    if (existing.rowCount) {
+      labelIds.push(existing.rows[0].id);
+      continue;
+    }
+
+    const created = await pool.query(
+      `INSERT INTO labels (project_id, name, color)
+       VALUES ($1, $2, $3)
+       RETURNING id`,
+      [projectId, name, colorForLabel(name)]
+    );
+    labelIds.push(created.rows[0].id);
+  }
+
+  for (const labelId of labelIds) {
+    await pool.query(
+      `INSERT INTO issue_labels (issue_id, label_id)
+       VALUES ($1, $2)
+       ON CONFLICT DO NOTHING`,
+      [issueId, labelId]
+    );
+  }
 }
 
 const loginSchema = z.object({
@@ -153,7 +230,7 @@ const updateUserSchema = z.object({
 });
 
 app.patch("/api/users/:userId", async (req, res) => {
-  const actorId = (req as express.Request & { userId: number }).userId;
+  const actorId = (req as unknown as { userId: number }).userId;
   const userId = Number(req.params.userId);
   const body = updateUserSchema.parse(req.body);
   if (!await requireAdmin(actorId)) return res.status(403).json({ error: "Admin access required" });
@@ -180,7 +257,7 @@ app.patch("/api/users/:userId", async (req, res) => {
 });
 
 app.delete("/api/users/:userId", async (req, res) => {
-  const actorId = (req as express.Request & { userId: number }).userId;
+  const actorId = (req as unknown as { userId: number }).userId;
   const userId = Number(req.params.userId);
   if (!await requireAdmin(actorId)) return res.status(403).json({ error: "Admin access required" });
   const assigned = await pool.query(
@@ -283,11 +360,24 @@ app.get("/api/projects/:projectId/board", async (req, res) => {
        i.description,
        i.priority,
        i.created_at AS "createdAt",
+       i.due_date::text AS "dueDate",
        i.status_id AS "statusId",
-       json_build_object('id', u.id, 'name', u.name, 'email', u.email) AS assignee
+       CASE
+         WHEN u.id IS NULL THEN NULL
+         ELSE json_build_object('id', u.id, 'name', u.name, 'email', u.email)
+       END AS assignee,
+       COALESCE(
+         json_agg(
+           DISTINCT jsonb_build_object('id', l.id, 'name', l.name, 'color', l.color)
+         ) FILTER (WHERE l.id IS NOT NULL),
+         '[]'::json
+       ) AS labels
      FROM issues i
      LEFT JOIN users u ON u.id = i.assignee_id
+     LEFT JOIN issue_labels il ON il.issue_id = i.id
+     LEFT JOIN labels l ON l.id = il.label_id
      WHERE i.project_id = $1
+     GROUP BY i.id, u.id
      ORDER BY i.created_at DESC`,
     [projectId]
   );
@@ -318,15 +408,31 @@ app.get("/api/issues/:issueId", async (req, res) => {
        i.priority,
        i.created_at AS "createdAt",
        i.updated_at AS "updatedAt",
+       i.due_date::text AS "dueDate",
        i.project_id AS "projectId",
        json_build_object('id', s.id, 'name', s.name, 'color', s.color) AS status,
-       json_build_object('id', a.id, 'name', a.name, 'email', a.email) AS assignee,
-       json_build_object('id', r.id, 'name', r.name, 'email', r.email) AS reporter
+       CASE
+         WHEN a.id IS NULL THEN NULL
+         ELSE json_build_object('id', a.id, 'name', a.name, 'email', a.email)
+       END AS assignee,
+       CASE
+         WHEN r.id IS NULL THEN NULL
+         ELSE json_build_object('id', r.id, 'name', r.name, 'email', r.email)
+       END AS reporter,
+       COALESCE(
+         json_agg(
+           DISTINCT jsonb_build_object('id', l.id, 'name', l.name, 'color', l.color)
+         ) FILTER (WHERE l.id IS NOT NULL),
+         '[]'::json
+       ) AS labels
      FROM issues i
      JOIN statuses s ON s.id = i.status_id
      LEFT JOIN users a ON a.id = i.assignee_id
      LEFT JOIN users r ON r.id = i.reporter_id
-     WHERE i.id = $1`,
+     LEFT JOIN issue_labels il ON il.issue_id = i.id
+     LEFT JOIN labels l ON l.id = il.label_id
+     WHERE i.id = $1
+     GROUP BY i.id, s.id, a.id, r.id`,
     [issueId]
   );
 
@@ -394,6 +500,24 @@ app.get("/api/issues/:issueId", async (req, res) => {
   });
 });
 
+app.get("/api/projects/:projectId/labels", async (req, res) => {
+  const projectId = Number(req.params.projectId);
+  const { rows } = await pool.query(
+    `SELECT
+       l.id,
+       l.name,
+       l.color,
+       COUNT(il.issue_id)::int AS "issueCount"
+     FROM labels l
+     LEFT JOIN issue_labels il ON il.label_id = l.id
+     WHERE l.project_id = $1
+     GROUP BY l.id
+     ORDER BY lower(l.name)`,
+    [projectId]
+  );
+  res.json(rows);
+});
+
 const createIssueSchema = z.object({
   projectId: z.number(),
   title: z.string().min(3),
@@ -401,6 +525,8 @@ const createIssueSchema = z.object({
   assigneeId: z.number().nullable().optional(),
   reporterId: z.number().optional().default(1),
   priority: z.enum(["low", "medium", "high"]).default("medium"),
+  dueDate: z.string().date().nullable().optional(),
+  labels: z.array(z.string()).default([]),
 });
 
 app.post("/api/issues", async (req, res) => {
@@ -422,8 +548,8 @@ app.post("/api/issues", async (req, res) => {
 
   const issueResult = await pool.query(
     `INSERT INTO issues (
-       project_id, title, description, status_id, assignee_id, reporter_id, priority
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       project_id, title, description, status_id, assignee_id, reporter_id, priority, due_date
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      RETURNING id`,
     [
       body.projectId,
@@ -433,10 +559,13 @@ app.post("/api/issues", async (req, res) => {
       body.assigneeId ?? null,
       body.reporterId,
       body.priority,
+      body.dueDate ?? null,
     ]
   );
 
   const issueId = issueResult.rows[0].id;
+
+  await syncIssueLabels(issueId, body.projectId, body.labels);
 
   await pool.query(
     `INSERT INTO issue_history (issue_id, actor_id, field, from_value, to_value)
@@ -452,17 +581,39 @@ const updateIssueSchema = z.object({
   description: z.string().optional(),
   priority: z.enum(["low", "medium", "high"]).optional(),
   assigneeId: z.number().nullable().optional(),
+  dueDate: z.string().date().nullable().optional(),
+  labels: z.array(z.string()).optional(),
 });
 
 app.patch("/api/issues/:issueId", async (req, res) => {
-  const actorId = (req as express.Request & { userId: number }).userId;
+  const actorId = (req as unknown as { userId: number }).userId;
   const issueId = Number(req.params.issueId);
   const body = updateIssueSchema.parse(req.body);
 
-  const issueResult = await pool.query("SELECT id FROM issues WHERE id = $1", [issueId]);
+  const issueResult = await pool.query(
+    `SELECT
+       i.id,
+       i.project_id AS "projectId",
+       i.due_date::text AS "dueDate",
+       COALESCE(
+         ARRAY(
+           SELECT l.name
+           FROM issue_labels il
+           JOIN labels l ON l.id = il.label_id
+           WHERE il.issue_id = i.id
+           ORDER BY lower(l.name)
+         ),
+         ARRAY[]::text[]
+       ) AS labels
+     FROM issues i
+     WHERE i.id = $1`,
+    [issueId]
+  );
   if (issueResult.rowCount === 0) {
     return res.status(404).json({ error: "Issue not found" });
   }
+
+  const issue = issueResult.rows[0];
 
   const updates: string[] = [];
   const values: unknown[] = [];
@@ -472,18 +623,25 @@ app.patch("/api/issues/:issueId", async (req, res) => {
   if (body.description !== undefined) { updates.push(`description = $${idx++}`); values.push(body.description); }
   if (body.priority !== undefined) { updates.push(`priority = $${idx++}`); values.push(body.priority); }
   if (body.assigneeId !== undefined) { updates.push(`assignee_id = $${idx++}`); values.push(body.assigneeId); }
+  if (body.dueDate !== undefined) { updates.push(`due_date = $${idx++}`); values.push(body.dueDate); }
 
-  if (updates.length === 0) return res.json({ ok: true });
+  if (updates.length === 0 && body.labels === undefined) return res.json({ ok: true });
 
-  updates.push(`updated_at = NOW()`);
-  values.push(issueId);
+  if (updates.length > 0) {
+    updates.push(`updated_at = NOW()`);
+    values.push(issueId);
 
-  await pool.query(
-    `UPDATE issues SET ${updates.join(", ")} WHERE id = $${idx}`,
-    values
-  );
+    await pool.query(
+      `UPDATE issues SET ${updates.join(", ")} WHERE id = $${idx}`,
+      values
+    );
+  }
 
-  const fields = ["title", "description", "priority", "assigneeId"] as const;
+  if (body.labels !== undefined) {
+    await syncIssueLabels(issueId, issue.projectId, body.labels);
+  }
+
+  const fields = ["title", "description", "priority", "assigneeId", "dueDate"] as const;
   for (const field of fields) {
     if (body[field] !== undefined) {
       await pool.query(
@@ -494,6 +652,19 @@ app.patch("/api/issues/:issueId", async (req, res) => {
     }
   }
 
+  if (body.labels !== undefined) {
+    await pool.query(
+      `INSERT INTO issue_history (issue_id, actor_id, field, from_value, to_value)
+       VALUES ($1, $2, 'labels', $3, $4)`,
+      [
+        issueId,
+        actorId,
+        issue.labels.join(", "),
+        normalizeLabelNames(body.labels).join(", "),
+      ]
+    );
+  }
+
   res.json({ ok: true });
 });
 
@@ -502,7 +673,7 @@ const statusChangeSchema = z.object({
 });
 
 app.patch("/api/issues/:issueId/status", async (req, res) => {
-  const actorId = (req as express.Request & { userId: number }).userId;
+  const actorId = (req as unknown as { userId: number }).userId;
   const issueId = Number(req.params.issueId);
   const body = statusChangeSchema.parse(req.body);
 
@@ -562,7 +733,7 @@ const commentSchema = z.object({
 });
 
 app.post("/api/issues/:issueId/comments", async (req, res) => {
-  const actorId = (req as express.Request & { userId: number }).userId;
+  const actorId = (req as unknown as { userId: number }).userId;
   const issueId = Number(req.params.issueId);
   const body = commentSchema.parse(req.body);
 
@@ -582,7 +753,7 @@ app.post("/api/issues/:issueId/comments", async (req, res) => {
 });
 
 app.post("/api/issues/:issueId/attachments", upload.single("file"), async (req, res) => {
-  const uploadedBy = (req as express.Request & { userId: number }).userId;
+  const uploadedBy = (req as unknown as { userId: number }).userId;
   const issueId = Number(req.params.issueId);
   if (!req.file) return res.status(400).json({ error: "No file provided" });
 

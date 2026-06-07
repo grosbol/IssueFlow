@@ -7,6 +7,7 @@ IssueFlow is a small, on-prem friendly issue tracker inspired by Jira, Trello, a
 - `backend/`: Express + TypeScript API with PostgreSQL schema and workflow transition validation
 - `frontend/`: React + TypeScript board UI with issue detail panel
 - `docker-compose.yml`: local app + Postgres setup
+- `gitlab`: optional self-hosted GitLab CE service in Docker with persistent volumes
 
 ## MVP features
 
@@ -36,6 +37,7 @@ docker compose up --build
 ```
 
 The API will be available on `http://localhost:4000`.
+The bundled GitLab instance will be available on `http://localhost:8929` after its first boot completes.
 
 ### 3. Run the frontend locally
 
@@ -100,3 +102,11 @@ It installs dependencies and runs:
 - Replace demo credentials and seed data before exposing the app
 - Put the frontend behind a reverse proxy and lock down CORS to the deployed origin
 - Add backups for the Postgres volume before treating the instance as durable
+- Size the GitLab container conservatively; the first boot can take a few minutes and uses significantly more memory than the app itself
+
+## GitLab notes
+
+- Start everything with `docker compose up --build`, or start only GitLab with `docker compose up -d gitlab`
+- Open `http://localhost:8929` once the container reports healthy logs
+- Fetch the initial GitLab root password with `docker compose exec gitlab grep 'Password:' /etc/gitlab/initial_root_password`
+- SSH clone URLs will use port `2224` by default

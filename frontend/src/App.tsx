@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import DOMPurify from "dompurify";
 import UsersPage from "./UsersPage";
 import LoginPage from "./LoginPage";
@@ -7,6 +7,7 @@ import WorkflowPage from "./WorkflowPage";
 import ProjectsPage from "./ProjectsPage";
 
 type ActiveUser = { id: number; name: string; email: string; role: "admin" | "user"; locale: string };
+type Label = { id: number; name: string; color: string };
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:4000";
 
@@ -30,6 +31,8 @@ type IssueCard = {
   description: string;
   priority: string;
   createdAt: string;
+  dueDate: string | null;
+  labels: Label[];
   statusId: number;
   assignee: null | User;
 };
@@ -56,6 +59,8 @@ type IssueDetail = {
     priority: string;
     createdAt: string;
     updatedAt: string;
+    dueDate: string | null;
+    labels: Label[];
     projectId: number;
     status: { id: number; name: string; color: string };
     assignee: null | User;
@@ -75,6 +80,33 @@ type IssueDetail = {
 };
 
 const PRIORITIES = ["low", "medium", "high"] as const;
+
+function stripHtml(html: string) {
+  return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function parseLabelInput(value: string) {
+  return value
+    .split(",")
+    .map((label) => label.trim())
+    .filter(Boolean);
+}
+
+function toLocalDateInputValue(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function comparePriority(priority: string) {
+  const order = { high: 0, medium: 1, low: 2 } as const;
+  return order[priority as keyof typeof order] ?? 99;
+}
+
+function formatDueDate(date: string, locale: string) {
+  return new Date(`${date}T00:00:00`).toLocaleDateString(locale);
+}
 
 function App() {
   const [currentUser, setCurrentUser] = useState<ActiveUser | null>(null);
@@ -102,6 +134,8 @@ function App() {
   const [createDesc, setCreateDesc] = useState("");
   const [createPriority, setCreatePriority] = useState<"low" | "medium" | "high">("medium");
   const [createAssignee, setCreateAssignee] = useState<number | "">("");
+  const [createDueDate, setCreateDueDate] = useState("");
+  const [createLabels, setCreateLabels] = useState("");
 
   // edit state
   const [editing, setEditing] = useState(false);
@@ -109,6 +143,14 @@ function App() {
   const [editDesc, setEditDesc] = useState("");
   const [editPriority, setEditPriority] = useState<"low" | "medium" | "high">("medium");
   const [editAssignee, setEditAssignee] = useState<number | "">("");
+  const [editDueDate, setEditDueDate] = useState("");
+  const [editLabels, setEditLabels] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [priorityFilter, setPriorityFilter] = useState<"all" | "low" | "medium" | "high">("all");
+  const [assigneeFilter, setAssigneeFilter] = useState<number | "all" | "unassigned">("all");
+  const [labelFilter, setLabelFilter] = useState("all");
+  const [dueFilter, setDueFilter] = useState<"all" | "overdue" | "today" | "upcoming" | "no-due-date">("all");
+  const [sortMode, setSortMode] = useState<"newest" | "oldest" | "priority" | "due-soon" | "due-late">("newest");
 
   function closeModal() {
     setSelectedIssueId(null);
@@ -122,6 +164,8 @@ function App() {
     setCreateDesc("");
     setCreatePriority("medium");
     setCreateAssignee("");
+    setCreateDueDate("");
+    setCreateLabels("");
   }
 
   async function loadProjects() {
@@ -154,13 +198,15 @@ function App() {
     setEditDesc(data.issue.description);
     setEditPriority(data.issue.priority as "low" | "medium" | "high");
     setEditAssignee(data.issue.assignee?.id ?? "");
+    setEditDueDate(data.issue.dueDate ?? "");
+    setEditLabels(data.issue.labels.map((label) => label.name).join(", "));
   }
 
-  useEffect(() => { void loadProjects(); }, []);
-  useEffect(() => { void loadBoard(); }, [activeProjectId]);
+  useEffect(() => { if (currentUser) void loadProjects(); }, [currentUser]);
+  useEffect(() => { if (currentUser) void loadBoard(); }, [activeProjectId, currentUser]);
   useEffect(() => {
-    apiFetch(`/api/users`).then((r) => r.json()).then(setUsers);
-  }, []);
+    if (currentUser) apiFetch(`/api/users`).then((r) => r.json()).then(setUsers);
+  }, [currentUser]);
   useEffect(() => {
     if (selectedIssueId !== null) void loadIssue(selectedIssueId);
   }, [selectedIssueId]);
@@ -260,6 +306,8 @@ function App() {
         assigneeId: createAssignee === "" ? null : createAssignee,
         reporterId: currentUser!.id,
         priority: createPriority,
+        dueDate: createDueDate || null,
+        labels: parseLabelInput(createLabels),
       }),
     });
     closeCreate();
@@ -277,7 +325,8 @@ function App() {
         description: editDesc,
         priority: editPriority,
         assigneeId: editAssignee === "" ? null : editAssignee,
-        actorId: currentUser!.id,
+        dueDate: editDueDate || null,
+        labels: parseLabelInput(editLabels),
       }),
     });
     setEditing(false);
@@ -288,6 +337,63 @@ function App() {
   // sync theme class on root element and persist
   document.documentElement.className = theme === "light" ? "light" : "";
   localStorage.setItem("theme", theme);
+
+  const today = toLocalDateInputValue(new Date());
+  const labelOptions = board
+    ? Array.from(
+        new Map(
+          board.issues
+            .flatMap((issue) => issue.labels)
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .map((label) => [label.name.toLowerCase(), label])
+        ).values()
+      )
+    : [];
+
+  const visibleIssues = board
+    ? [...board.issues]
+        .filter((issue) => {
+          const normalizedSearch = searchQuery.trim().toLowerCase();
+          const searchTarget = [
+            issue.title,
+            stripHtml(issue.description),
+            issue.assignee?.name ?? "",
+            ...issue.labels.map((label) => label.name),
+          ].join(" ").toLowerCase();
+
+          if (normalizedSearch && !searchTarget.includes(normalizedSearch)) return false;
+          if (priorityFilter !== "all" && issue.priority !== priorityFilter) return false;
+          if (assigneeFilter === "unassigned" && issue.assignee !== null) return false;
+          if (typeof assigneeFilter === "number" && issue.assignee?.id !== assigneeFilter) return false;
+          if (labelFilter !== "all" && !issue.labels.some((label) => label.name === labelFilter)) return false;
+          if (dueFilter === "overdue" && (!issue.dueDate || issue.dueDate >= today)) return false;
+          if (dueFilter === "today" && issue.dueDate !== today) return false;
+          if (dueFilter === "upcoming" && (!issue.dueDate || issue.dueDate <= today)) return false;
+          if (dueFilter === "no-due-date" && issue.dueDate !== null) return false;
+          return true;
+        })
+        .sort((a, b) => {
+          if (sortMode === "oldest") {
+            return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+          }
+          if (sortMode === "priority") {
+            return comparePriority(a.priority) - comparePriority(b.priority);
+          }
+          if (sortMode === "due-soon") {
+            if (!a.dueDate && !b.dueDate) return 0;
+            if (!a.dueDate) return 1;
+            if (!b.dueDate) return -1;
+            return a.dueDate.localeCompare(b.dueDate);
+          }
+          if (sortMode === "due-late") {
+            if (!a.dueDate && !b.dueDate) return 0;
+            if (!a.dueDate) return 1;
+            if (!b.dueDate) return -1;
+            return b.dueDate.localeCompare(a.dueDate);
+          }
+          return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+        })
+    : [];
 
   if (!currentUser) return <LoginPage onLogin={setCurrentUser} />;
   if (!board && page === "board") return <div className="shell">Loading IssueFlow...</div>;
@@ -379,8 +485,8 @@ function App() {
           <p className="hero-subtitle">Simple, focused issue tracking built for your team.</p>
           <div className="hero-chips">
             <span className="hero-chip">
-              <span className="hero-chip-val">{board.issues.length}</span>
-              <span className="hero-chip-label">Issues</span>
+              <span className="hero-chip-val">{visibleIssues.length}</span>
+              <span className="hero-chip-label">{visibleIssues.length === board.issues.length ? "Issues" : "Matching"}</span>
             </span>
             <span className="hero-chip">
               <span className="hero-chip-val">{board.statuses.length}</span>
@@ -433,6 +539,18 @@ function App() {
                   </select>
                 </label>
               </div>
+              <div className="form-row two-col">
+                <label>Due date
+                  <input type="date" value={createDueDate} onChange={(e) => setCreateDueDate(e.target.value)} />
+                </label>
+                <label>Labels
+                  <input
+                    value={createLabels}
+                    onChange={(e) => setCreateLabels(e.target.value)}
+                    placeholder="frontend, backend, ux"
+                  />
+                </label>
+              </div>
               <button className="btn-primary" type="submit">Create</button>
             </form>
           </div>
@@ -440,8 +558,88 @@ function App() {
       )}
 
       <main className="board-full">
+        <section className="board-controls">
+          <div className="board-controls-head">
+            <div>
+              <p className="eyebrow">Issue Management</p>
+              <h2>Search, filter, and sort work in flight</h2>
+            </div>
+            <button
+              type="button"
+              className="btn-ghost"
+              onClick={() => {
+                setSearchQuery("");
+                setPriorityFilter("all");
+                setAssigneeFilter("all");
+                setLabelFilter("all");
+                setDueFilter("all");
+                setSortMode("newest");
+              }}
+            >
+              Reset filters
+            </button>
+          </div>
+          <div className="board-filters">
+            <label>
+              Search
+              <input
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Title, description, assignee, or label"
+              />
+            </label>
+            <label>
+              Priority
+              <select value={priorityFilter} onChange={(e) => setPriorityFilter(e.target.value as typeof priorityFilter)}>
+                <option value="all">All priorities</option>
+                {PRIORITIES.map((priority) => <option key={priority} value={priority}>{priority}</option>)}
+              </select>
+            </label>
+            <label>
+              Assignee
+              <select
+                value={String(assigneeFilter)}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setAssigneeFilter(value === "all" || value === "unassigned" ? value : Number(value));
+                }}
+              >
+                <option value="all">Anyone</option>
+                <option value="unassigned">Unassigned</option>
+                {users.map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}
+              </select>
+            </label>
+            <label>
+              Label
+              <select value={labelFilter} onChange={(e) => setLabelFilter(e.target.value)}>
+                <option value="all">All labels</option>
+                {labelOptions.map((label) => <option key={label.id} value={label.name}>{label.name}</option>)}
+              </select>
+            </label>
+            <label>
+              Due
+              <select value={dueFilter} onChange={(e) => setDueFilter(e.target.value as typeof dueFilter)}>
+                <option value="all">Any due date</option>
+                <option value="overdue">Overdue</option>
+                <option value="today">Due today</option>
+                <option value="upcoming">Upcoming</option>
+                <option value="no-due-date">No due date</option>
+              </select>
+            </label>
+            <label>
+              Sort
+              <select value={sortMode} onChange={(e) => setSortMode(e.target.value as typeof sortMode)}>
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="priority">Priority</option>
+                <option value="due-soon">Due soon</option>
+                <option value="due-late">Due latest</option>
+              </select>
+            </label>
+          </div>
+        </section>
         {board.statuses.map((status) => {
-          const issues = board.issues.filter((i) => i.statusId === status.id);
+          const issues = visibleIssues.filter((i) => i.statusId === status.id);
           return (
             <div
               className={`column ${dragOverStatusId === status.id ? "drop-target" : ""}`}
@@ -471,7 +669,29 @@ function App() {
                       <span className="issue-key">{board.project.key}-{issue.id}</span>
                     </div>
                     <strong>{issue.title}</strong>
-                    {issue.description && <p className="card-desc">{issue.description.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim()}</p>}
+                    {issue.description && <p className="card-desc">{stripHtml(issue.description)}</p>}
+                    {(issue.labels.length > 0 || issue.dueDate) && (
+                      <div className="card-meta-stack">
+                        {issue.labels.length > 0 && (
+                          <div className="label-row">
+                            {issue.labels.slice(0, 3).map((label) => (
+                              <span
+                                key={label.id}
+                                className="label-pill"
+                                style={{ backgroundColor: `${label.color}22`, borderColor: `${label.color}66`, color: label.color }}
+                              >
+                                {label.name}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                        {issue.dueDate && (
+                          <span className={`due-chip ${issue.dueDate < today ? "overdue" : ""}`}>
+                            Due {formatDueDate(issue.dueDate, currentUser.locale)}
+                          </span>
+                        )}
+                      </div>
+                    )}
                     <div className="card-bottom">
                       <span>{issue.assignee?.name ?? "Unassigned"}</span>
                       <span>{new Date(issue.createdAt).toLocaleDateString(currentUser.locale)}</span>
@@ -515,6 +735,18 @@ function App() {
                     </select>
                   </label>
                 </div>
+                <div className="form-row two-col">
+                  <label>Due date
+                    <input type="date" value={editDueDate} onChange={(e) => setEditDueDate(e.target.value)} />
+                  </label>
+                  <label>Labels
+                    <input
+                      value={editLabels}
+                      onChange={(e) => setEditLabels(e.target.value)}
+                      placeholder="frontend, backend, ux"
+                    />
+                  </label>
+                </div>
                 <button className="btn-primary" type="submit">Save changes</button>
               </form>
             ) : (
@@ -543,6 +775,10 @@ function App() {
                     <span className={`pill ${detail.issue.priority}`}>{detail.issue.priority}</span>
                   </div>
                   <div>
+                    <span className="meta-label">Due date</span>
+                    <strong>{detail.issue.dueDate ? formatDueDate(detail.issue.dueDate, currentUser.locale) : "None"}</strong>
+                  </div>
+                  <div>
                     <span className="meta-label">Assignee</span>
                     <strong>{detail.issue.assignee?.name ?? "Unassigned"}</strong>
                   </div>
@@ -550,6 +786,25 @@ function App() {
                     <span className="meta-label">Reporter</span>
                     <strong>{detail.issue.reporter?.name ?? "Unknown"}</strong>
                   </div>
+                </div>
+
+                <div className="actions">
+                  <span className="meta-label">Labels</span>
+                  {detail.issue.labels.length > 0 ? (
+                    <div className="label-row">
+                      {detail.issue.labels.map((label) => (
+                        <span
+                          key={label.id}
+                          className="label-pill"
+                          style={{ backgroundColor: `${label.color}22`, borderColor: `${label.color}66`, color: label.color }}
+                        >
+                          {label.name}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <span className="meta-label">No labels yet</span>
+                  )}
                 </div>
 
                 <div className="actions">

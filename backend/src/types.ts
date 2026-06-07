@@ -18,6 +18,12 @@ export type BoardIssue = {
   description: string;
   priority: string;
   createdAt: string;
+  dueDate: string | null;
+  labels: Array<{
+    id: number;
+    name: string;
+    color: string;
+  }>;
   assignee: null | {
     id: number;
     name: string;
@@ -25,4 +31,3 @@ export type BoardIssue = {
   };
   statusId: number;
 };
-
