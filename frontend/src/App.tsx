@@ -85,6 +85,14 @@ function stripHtml(html: string) {
   return html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
 }
 
+function csvEscape(value: string) {
+  const s = String(value ?? "");
+  if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
 function parseLabelInput(value: string) {
   return value
     .split(",")
@@ -395,6 +403,53 @@ function App() {
         })
     : [];
 
+  function exportCSV() {
+    if (!board) return;
+    const statusMap = new Map(board.statuses.map((s) => [s.id, s.name]));
+    const header = ["ID", "Title", "Status", "Priority", "Assignee", "Due Date", "Labels", "Created At", "Description"];
+    const rows = visibleIssues.map((issue) => [
+      issue.id,
+      issue.title,
+      statusMap.get(issue.statusId) ?? "",
+      issue.priority,
+      issue.assignee?.name ?? "",
+      issue.dueDate ?? "",
+      issue.labels.map((l) => l.name).join("; "),
+      new Date(issue.createdAt).toISOString(),
+      stripHtml(issue.description),
+    ].map(String).map(csvEscape));
+    const csv = [header.map(csvEscape), ...rows].map((r) => r.join(",")).join("\n");
+    triggerDownload(csv, `${board.project.key}-issues.csv`, "text/csv");
+  }
+
+  function exportJSON() {
+    if (!board) return;
+    const statusMap = new Map(board.statuses.map((s) => [s.id, s.name]));
+    const data = visibleIssues.map((issue) => ({
+      id: issue.id,
+      key: `${board.project.key}-${issue.id}`,
+      title: issue.title,
+      status: statusMap.get(issue.statusId) ?? "",
+      priority: issue.priority,
+      assignee: issue.assignee?.name ?? null,
+      dueDate: issue.dueDate ?? null,
+      labels: issue.labels.map((l) => l.name),
+      createdAt: issue.createdAt,
+      description: stripHtml(issue.description),
+    }));
+    triggerDownload(JSON.stringify(data, null, 2), `${board.project.key}-issues.json`, "application/json");
+  }
+
+  function triggerDownload(content: string, filename: string, mimeType: string) {
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   if (!currentUser) return <LoginPage onLogin={setCurrentUser} />;
   if (!board && page === "board") return <div className="shell">Loading IssueFlow...</div>;
 
@@ -564,20 +619,28 @@ function App() {
               <p className="eyebrow">Issue Management</p>
               <h2>Search, filter, and sort work in flight</h2>
             </div>
-            <button
-              type="button"
-              className="btn-ghost"
-              onClick={() => {
-                setSearchQuery("");
-                setPriorityFilter("all");
-                setAssigneeFilter("all");
-                setLabelFilter("all");
-                setDueFilter("all");
-                setSortMode("newest");
-              }}
-            >
-              Reset filters
-            </button>
+            <div style={{ display: "flex", gap: "0.5rem" }}>
+              <button type="button" className="btn-ghost" onClick={exportCSV} title="Export visible issues as CSV">
+                ↓ CSV
+              </button>
+              <button type="button" className="btn-ghost" onClick={exportJSON} title="Export visible issues as JSON">
+                ↓ JSON
+              </button>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => {
+                  setSearchQuery("");
+                  setPriorityFilter("all");
+                  setAssigneeFilter("all");
+                  setLabelFilter("all");
+                  setDueFilter("all");
+                  setSortMode("newest");
+                }}
+              >
+                Reset filters
+              </button>
+            </div>
           </div>
           <div className="board-filters">
             <label>
