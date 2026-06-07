@@ -419,7 +419,7 @@ function App() {
       stripHtml(issue.description),
     ].map(String).map(csvEscape));
     const csv = [header.map(csvEscape), ...rows].map((r) => r.join(",")).join("\n");
-    triggerDownload(csv, `${board.project.key}-issues.csv`, "text/csv");
+    triggerDownload(csv, `${board.project.key}-issues.csv`, "text/csv", true);
   }
 
   function exportJSON() {
@@ -437,11 +437,12 @@ function App() {
       createdAt: issue.createdAt,
       description: stripHtml(issue.description),
     }));
-    triggerDownload(JSON.stringify(data, null, 2), `${board.project.key}-issues.json`, "application/json");
+    triggerDownload(JSON.stringify(data, null, 2), `${board.project.key}-issues.json`, "application/json", false);
   }
 
-  function triggerDownload(content: string, filename: string, mimeType: string) {
-    const blob = new Blob([content], { type: mimeType });
+  function triggerDownload(content: string, filename: string, mimeType: string, bom = false) {
+    const parts = bom ? ["﻿", content] : [content];
+    const blob = new Blob(parts, { type: `${mimeType};charset=utf-8` });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
